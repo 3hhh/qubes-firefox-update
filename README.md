@@ -19,13 +19,15 @@ Nevertheless it should work for other Linux operating systems, too.
 ## Table of contents
 
 - [Installation](#installation)
-  - [All OSes: Firefox configuration changes](#all-oses:-firefox-configuration-changes)
+  - [All OSes: Firefox configuration changes](#all-oses-firefox-configuration-changes)
   - [Qubes OS](#qubes-os)
     - [Install Firefox](#install-firefox)
     - [Install qubes-firefox-update](#install-qubes-firefox-update)
   - [Other Linux OSes](#other-linux-oses)
   - [A word of caution](#a-word-of-caution)
 - [Usage](#usage)
+  - [Qubes OS](#qubes-os-1)
+  - [Other Linux OSes](#other-linux-oses-1)
 - [Uninstall](#uninstall)
 - [Copyright](#copyright)
 
