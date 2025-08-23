@@ -1,0 +1,411 @@
+#!/bin/bash
+#
+# See usage().
+#
+# Copyright (C) 2025  David Hobach  GPLv3
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+# 
+
+set -o pipefail
+
+SCRIPT_DIR="$(readlink -f "${BASH_SOURCE[0]}")" || exit 6
+SCRIPT_DIR="$(dirname "$SCRIPT_DIR")" || exit 6
+SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
+
+#import common code
+source "$SCRIPT_DIR/common" || exit 7
+
+#where the files will be downloaded to
+DOWNLOAD_DIR="$SCRIPT_DIR/tmp-down"
+DOWNLOAD_DIR_FIREFOX="$DOWNLOAD_DIR/firefox"
+DOWNLOAD_DIR_ADDONS="$DOWNLOAD_DIR/firefox-addons"
+
+#arkenfox repo URL & directory to use
+ARKENFOX_REPO="https://github.com/arkenfox/user.js"
+DOWNLOAD_DIR_ARKENFOX="$DOWNLOAD_DIR/arkenfox"
+
+#where to write arkenfox output (user.ks & prefs.js)
+ARKENFOX_OUT="$DOWNLOAD_DIR/arkenfox-out"
+
+#static fallback when the addon ID cannot be found inside the manifest.json (which is allowed)
+#addon name (from download URL) --> ID
+#check about:support to find an addon ID
+declare -A ADDON_IDS=(
+	["indicatetls"]="{252ee273-8c8d-4609-b54d-62ae345be0a1}"
+)
+
+function usage {
+echo "$SCRIPT_NAME [options] [addon 1] ... [addon n]
+
+Download the latest firefox version (if necessary) and whatever plugins are passed to this script.
+
+[addon]:
+Arbitrary number of names to addon description pages whose xpi files are meant to be downloaded
+(e.g. ublock-origin --> https://addons.mozilla.org/en-US/firefox/addon/ublock-origin/).
+If none (--) are passed, only firefox is updated.
+
+[options]:
+  --lversion [version]
+    Installed local firefox version. If it's not passed, the output of firefox -v is used instead.
+
+  --rversion [version]
+    Remote firefox version to download. If it's not passed, the most recent one is used instead.
+
+  --arch [architecture]
+    The processor architecture. If it's not passed, the output of uname -m is used instead.
+
+  --lang [language]
+    The firefox language. If it's not passed, the $LANG is used instead.
+
+  -u
+    Also generate an updated user.js and prefs.js from the arkenfox repository.
+    Updates are applied to the locally installed files.
+
+  --user-override [file]
+    Use the given file to override user.js settings with arkenfox. Only makes sense with -u.
+
+  -s
+    Skip the firefox update download and only download addons.
+
+  -h --help
+    Show this help."
+exit 1
+}
+
+#copied from blib:
+#+b_fs_isEmptyDir [dir]
+#+Check whether the given directory is empty or non-existing. It is not checked whether the passed parameter is a file preventing a directory from being created.
+#+[dir]: full path to the directory to check
+#+returns: a zero exit code if the directory does not exist or is empty
+function b_fs_isEmptyDir {
+local dir="$1"
+#test returns 0, if a file exists in the dir, 1 if there is no file and 2 if the * was incorrect as there is > 1 file (too many arguments)
+test -e "$dir/"* 2> /dev/null
+    case $? in
+        1)      return 0 ;;
+        *)      return 1 ;;
+    esac
+}
+
+#getRemoteFirefoxVersion [arch] [lang]
+function getRemoteFirefoxVersion {
+local arch="$1"
+local lang="$2"
+local archUri="linux64"
+[ "$arch" != "x86_64" ] && archUri="linux"
+
+local url="https://download.mozilla.org/?product=firefox-latest&os=${archUri}&lang=$lang"
+
+local ret=""
+ret="$(curl -f -L --head "$url" 2> /dev/null)" || error "Failed to retrieve the remote firefox version."
+
+echo "$ret" | sed -r -n 's/^Location:.*\/releases\/([0-9\.]+)\/.*/\1/p'
+return 0
+}
+
+#getRunningArch []
+#returns: The currently running processor architecture in the same syntax as https://archive.mozilla.org/pub/firefox/releases/58.0/linux-x86_64/ without "linux-".
+function getRunningArch {
+local runningArch=""
+runningArch="$(uname -m)" || error "Failed to retrieve the currently running arch."
+
+	case "$runningArch" in
+		"x86_64")
+		echo "x86_64"
+		;;
+
+		"i386")
+		echo "i686"
+		;;
+
+		"i686")
+		echo "i686"
+		;;
+
+		*)
+		echo "x86_64"
+		;;
+	esac
+return 0
+}
+
+#getRunningLang []
+#returns: The currently running OS language in the same format as https://archive.mozilla.org/pub/firefox/releases/58.0/linux-x86_64/
+function getRunningLang {
+[ -z "$LANG" ] && error "The system language could not be retrieved!"
+
+if [[ "$LANG" = "en_"* ]] ; then
+	sed -r -n 's/^en_([A-Z]+).*/en-\1/p' <<< "$LANG" || error "Failed to execute sed. Not installed?!"
+else
+	sed -r -n 's/_.*$//p' <<< "$LANG" || error "Failed to execute sed. Not installed?!"
+fi
+return 0
+}
+
+#downloadFile [URL] [dir]
+#download the given file to the given dir
+#returns: sets a non-zero exit code on errors
+function downloadFile {
+local url="$1"
+local dir="$2"
+local ret=
+echo "Downloading ${url}..."
+local file="${url##*/}"
+[ -z "$file" ] && return 1
+file="$dir/$file"
+mkdir -p "$dir" || return 1
+
+#run curl and use its exit code as return status
+curl -f -L "$url" > "$file"
+ret=$?
+[ $ret -ne 0 ] && rm -f "$file" &> /dev/null #remove leftovers, if the download failed (the update checks whether there is just one file)
+return $ret
+}
+
+#downloadFirefoxUpdate [old version] [new version] [arch] [lang]
+function downloadFirefoxUpdate {
+local oVersion="$1"
+local nVersion="$2"
+local arch="$3"
+local lang="$4"
+
+#we download the .mar file as these are at least sometimes signed (only works with an existing firefox installation though)
+#the complete.mar are essentially a new firefox installation
+#first get a list of the available files
+local baseUrl="https://archive.mozilla.org/pub/firefox/releases/${nVersion}"
+local baseDownUrl="$baseUrl/update/linux-${arch}/${lang}"
+local marDown="$baseDownUrl/firefox-$oVersion-$nVersion.partial.mar"
+local marFullDown="$baseDownUrl/firefox-$nVersion.complete.mar"
+local hashDown="$baseUrl/SHA512SUMS"
+local ascHashDown="$hashDown.asc"
+
+#download
+downloadFile "$hashDown" "$DOWNLOAD_DIR_FIREFOX" || error "Failed to download the hash file!"
+downloadFile "$ascHashDown" "$DOWNLOAD_DIR_FIREFOX" || error "Failed to download the signature! Please check manually!"
+downloadFile "$marDown" "$DOWNLOAD_DIR_FIREFOX" 
+if [ $? -ne 0 ] ; then
+	echo "Failed to download a partial upgrade file... Trying the full upgrade..."
+	downloadFile "$marFullDown" "$DOWNLOAD_DIR_FIREFOX" || error "Failed to download the full upgrade file as well!"
+fi
+
+#set valid exit code
+return 0
+}
+
+#getAddonDownloadUrl [overview URL]
+function getAddonDownloadUrl {
+local oUrl="$1"
+local ret=""
+ret="$(curl -f "$oUrl")" || error "Failed to run curl on ${oUrl}."
+echo "$ret" | sed -r 's/\\u002F/\//g' | grep -E -o 'https://addons.mozilla.org/firefox/downloads/file/[^"?]+' | head -n1
+}
+
+#downloadAddons [lang] [addon name] ... [addon name n]
+function downloadAddons {
+local lang="$1"
+shift
+local addonOverviewUrl=""
+local addonUrl=""
+local addon=""
+while [ $# -gt 0 ] ; do
+	addon="$1"
+	shift
+	[ -z "$addon" ] && continue
+
+	addonOverviewUrl="https://addons.mozilla.org/${lang}/firefox/addon/${addon}/"
+
+	#get the download URL && download
+	addonUrl="$(getAddonDownloadUrl "$addonOverviewUrl")" || error "Failed to retrieve the addon download URL from the overview URL $addonOverviewUrl."
+	downloadFile "$addonUrl" "$DOWNLOAD_DIR_ADDONS" || error "Failed to download $addonUrl."
+done
+}
+
+#renameAddons []
+#Rename all addons in $DOWNLOAD_DIR_ADDONS to the name they specify in their manifest file. Firefox only accepts the automatic installation, if the name matches.
+function renameAddons {
+local manifest=""
+local id=
+
+for file in "$DOWNLOAD_DIR_ADDONS"/*.xpi ; do
+	manifest="$(unzip -p "$file" "manifest.json")" || error "Failed to extract the manifest.json file from ${file}."
+	id="$(sed -r -n 's/.*"id": "([^"]+)".*/\1/p' <<< "$manifest")" || error "Failed to execute sed."
+	if [ -z "$id" ] ; then
+		#try static fallback
+		local name="${file##*/}"
+		name="${name%%-*}"
+		id="${ADDON_IDS["$name"]}"
+		[ -z "$id" ] && error "Failed to extract the id from ${file}. Addon name: $name"
+	fi
+	mv "$file" "${DOWNLOAD_DIR_ADDONS}/${id}.xpi" || error "Failed to move ${file}."
+done
+return 0
+}
+
+function downloadArkenfox {
+deps "git"
+git clone "$ARKENFOX_REPO" "$DOWNLOAD_DIR_ARKENFOX" || error "Failed to clone the arkenfox repo."
+}
+
+function executeArkenfox {
+local profileDir=
+
+#copy overrides
+profileDir="$(getFirefoxProfileDir)" || error "Failed to obtain the firefox profile dir."
+if [ -n "$user_overrides" ] ; then
+	cp -f "$user_overrides" "$profileDir/user-overrides.js" || error "Failed to copy the user-overrides.js."
+fi
+
+#follow https://github.com/arkenfox/user.js/wiki/3.4-Apply-&-Update-&-Maintain
+#Apply: copy the arkenfox files
+cp -f "$DOWNLOAD_DIR_ARKENFOX/user.js" "$profileDir/user.js" || error "Failed to copy the user.js."
+cp -f "$DOWNLOAD_DIR_ARKENFOX/updater.sh" "$profileDir/updater.sh" || error "Failed to copy the updater.sh."
+cp -f "$DOWNLOAD_DIR_ARKENFOX/prefsCleaner.sh" "$profileDir/prefsCleaner.sh" || error "Failed to copy the prefsCleaner.sh."
+
+#Update: run updater.sh
+cd "$profileDir" || error "Failed to switch to $profileDir."
+./updater.sh -d -s || error "Failed to execute the arkenfox updater."
+./prefsCleaner.sh -s || error "Failed to execute the arkenfox prefs cleaner."
+cd - || error "Failed to switch back."
+
+#copy generated data back
+mkdir "$ARKENFOX_OUT" || error "Failed to create $ARKENFOX_OUT."
+cp -f "$profileDir/user.js" "$ARKENFOX_OUT" || error "Failed to copy the generated user.js."
+cp -f "$profileDir/prefs.js" "$ARKENFOX_OUT" || error "Failed to copy the generated prefs.js."
+#cp -fr "$profileDir/userjs_backups" "$ARKENFOX_OUT" || error "Failed to copy the user.js backups."
+#cp -fr "$profileDir/prefsjs_backups" "$ARKENFOX_OUT" || error "Failed to copy the prefs.js backups."
+
+#we only need the arkenfox output
+rm -rf "$DOWNLOAD_DIR_ARKENFOX" || error "Failed to remove $DOWNLOAD_DIR_ARKENFOX."
+}
+
+#main
+[ $# -lt 1 ] && usage
+
+fox_version=""
+remote_fox_version=""
+fox_arch=""
+fox_lang=""
+user_overrides=""
+skip_fox=1
+arkenfox=1
+
+#parse args
+while [ $# -gt 0 ] ; do
+	case "$1" in
+		"--")
+		shift
+		;;
+
+		"--lversion")
+		fox_version="$2"
+		shift 2
+		;;
+
+		"--rversion")
+		remote_fox_version="$2"
+		shift 2
+		;;
+
+		"--arch")
+		fox_arch="$2"
+		shift 2
+		;;
+
+		"--lang")
+		fox_lang="$2"
+		shift 2
+		;;
+
+		"-u")
+		arkenfox=0
+		shift
+		;;
+
+		"--user-override")
+		user_overrides="$2"
+		shift 2
+		;;
+
+		"-s")
+		skip_fox=0
+		shift
+		;;
+
+		"-h")
+		usage
+		;;
+
+		"--help")
+		usage
+		;;
+
+		"-"*)
+		error "Illegal option found."
+		;;
+
+		*)
+		#we hit the addons which are now in "$@"
+		break
+		;;
+	esac
+done
+
+deps "sed" "curl" "grep" "head" "unzip" "uname" "dirname" "readlink" "cp" "mv"
+
+#check whether we have a clean run (users might want to re-use downloaded files for different target VMs)
+! b_fs_isEmptyDir "$DOWNLOAD_DIR" && echo "The download directory $DOWNLOAD_DIR is not empty. Either clean it or re-use the files there." && exit 0
+
+#set defaults if necessary
+if [ -z "$fox_version" ] ; then
+	fox_version="$(getRunningFirefoxVersion)" || error "Failed to obtain the currently running firefox version."
+fi
+if [ -z "$fox_arch" ] ; then
+	fox_arch="$(getRunningArch)" || error "Failed to obtain the currently running arch."
+fi
+if [ -z "$fox_lang" ] ; then
+	fox_lang="$(getRunningLang)" || error "Failed to obtain the required language."
+fi
+if [ -z "$remote_fox_version" ] ; then
+	remote_fox_version="$(getRemoteFirefoxVersion "$fox_arch" "$fox_lang")" || error "Failed to retrieve the remote firefox version."
+fi
+
+#check whether we need to update firefox
+echo "Local firefox version: $fox_version"
+echo "Remote firefox version: $remote_fox_version"
+if [ $skip_fox -ne 0 ] ; then
+	[ "$fox_version" != "$remote_fox_version" ] && downloadFirefoxUpdate "$fox_version" "$remote_fox_version" "$fox_arch" "$fox_lang" || echo "Firefox appears to be up-to date - no update needed."
+else
+	echo "Skipping the firefox update download..."
+fi
+
+#download & rename addons
+#unfortunately the rename is required as firefox will otherwise silently drop the update -_-
+if [ $# -gt 0 ] ; then
+	echo "Downloading the addons..."
+	downloadAddons "$fox_lang" "$@"
+	echo "Renaming the addons..."
+	renameAddons
+fi
+
+#download arkenfox & update user.js
+if [ $arkenfox -eq 0 ] ; then
+	echo "Downloading arkenfox..."
+	downloadArkenfox
+	echo "Generating the user.js & prefs.js..."
+	executeArkenfox
+fi
+
+echo ""
+echo "Download done."

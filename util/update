@@ -1,0 +1,173 @@
+#!/bin/bash
+# 
+# See usage().
+#
+# Copyright (C) 2025  David Hobach  GPLv3
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+# 
+
+set -o pipefail
+
+SCRIPT_DIR="$(readlink -f "${BASH_SOURCE[0]}")" || exit 6
+SCRIPT_DIR="$(dirname "$SCRIPT_DIR")" || exit 6
+SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
+DIRECTORY_DEFAULT="$SCRIPT_DIR/tmp-down"
+
+#import common code
+source "$SCRIPT_DIR/common" || exit 7
+
+function usage {
+echo "$SCRIPT_NAME [options] [directory]
+
+Apply firefox updates downloaded via the download script.
+
+[directory]:
+Path to the directory where the updates were stored by the download script.
+Default (if it exists): $DIRECTORY_DEFAULT
+
+[options]:
+  -h --help
+   Show this help."
+exit 1
+}
+
+function getFirefoxPath {
+local ret=
+ret="$(which "firefox")" || error "Failed to execute which."
+ret="$(readlink -e "$ret")" || error "Failed to execute readlink."
+echo "${ret%/firefox}"
+}
+
+function installFirefoxUpdate {
+local src="$1"
+local srcFirefox="$src/firefox"
+local mozKey="$2"
+local firefoxPath hash updateFile
+
+#check whether we need to update anything at all
+updateFile="$(compgen -G "$srcFirefox"/*.mar)" || { echo "No firefox update found. Skipping..." ; return ; }
+
+#get the firefox install path
+firefoxPath="$(getFirefoxPath)" || error "Failed to obtain the firefox installation directory."
+
+#make sure that the updater exists
+local updater="$firefoxPath/updater"
+[ -f "$updater" ] || error "The updater is not installed at $updater. Looks like we failed to identify the correct firefox install path."
+
+#verify
+local hashFile="$srcFirefox/SHA512SUMS"
+local hashSigFile="$hashFile.asc"
+gpg --import "$mozKey" || error "Failed to import the mozilla key from $mozKey."
+gpg --verify "$hashSigFile" "$hashFile" || error "GPG signature verification of the firefox update failed! Please investigate!"
+hash="$(sha512sum "$updateFile")" || error "Failed to compute the hash of $updateFile."
+hash="${hash%% *}"
+[ -z "$hash" ] && error "Hash computation failed. Programming error?!"
+grep "$hash" "$hashFile" | grep "${updateFile##*/}" || error "GPG signature verification of the firefox update failed as we could not find the hash $hash inside $hashFile. Please investigate!"
+
+#create the update.mar file (required by the updater)
+local updateMar="$srcFirefox/update.mar"
+rm -f "$updateMar" &> /dev/null
+ln -s "$updateFile" "$updateMar" || error "Failed to create the updater symlink."
+
+#copy the updater (recommended by Mozilla, cf. https://wiki.mozilla.org/Software_Update:Manually_Installing_a_MAR_file)
+local updaterCopy="$srcFirefox/updater"
+cp -f "$updater" "$updaterCopy" || error "Failed to copy the updater."
+
+#install
+local fVersion=
+fVersion="$(getRunningFirefoxVersion)" || error "Failed to obtain the firefox version."
+LD_LIBRARY_PATH="$firefoxPath" "$updaterCopy" "$fVersion" "$srcFirefox" "$firefoxPath" "$firefoxPath" "first"
+}
+
+function installAddons {
+local src="$1"
+local srcAddons="$src/firefox-addons"
+local firefoxProfilePath="$2"
+
+[ -d "$srcAddons" ] || { echo "No firefox addons found. Skipping..." ; return ; }
+
+#make sure that the extension path exists
+local extensionPath="$firefoxProfilePath/extensions"
+[ -d "$extensionPath" ] || error "Could not find the extension path at $extensionPath."
+
+cp -f "$srcAddons"/*.xpi "$extensionPath" || error "Failed to install the firefox addons."
+}
+
+function installArkenfoxUserJs {
+local src="$1"
+local srcArkenfox="$src/arkenfox-out"
+local firefoxProfilePath="$2"
+
+[ -f "$srcArkenfox/user.js" ] || { echo "No arkenfox user.js updates found. Skipping..." ; return ; }
+
+#backup
+cp -f "$firefoxProfilePath/user.js" "$firefoxProfilePath/user.js.bak" &> /dev/null
+cp -f "$firefoxProfilePath/prefs.js" "$firefoxProfilePath/prefs.js.bak" &> /dev/null
+
+#install
+cp -f "$srcArkenfox/user.js" "$firefoxProfilePath/user.js" || error "Failed to install the arkenfox user.js."
+cp -f "$srcArkenfox/prefs.js" "$firefoxProfilePath/prefs.js" || error "Failed to install the arkenfox prefs.js."
+}
+
+#main
+#parse args
+while [ $# -gt 0 ] ; do
+	case "$1" in
+		"--")
+		shift
+		;;
+
+		"-h")
+		usage
+		;;
+
+		"--help")
+		usage
+		;;
+
+		*)
+		#we hit the remaining args
+		break
+		;;
+	esac
+done
+
+if [ $# -eq 1 ] ; then
+	directory="$1"
+elif [ $# -eq 0 ] && [ -d "$DIRECTORY_DEFAULT" ] ; then
+	directory="$DIRECTORY_DEFAULT"
+else
+	usage
+fi
+
+mozKey="$SCRIPT_DIR/mozkey.asc"
+firefoxProfileDir="$(getFirefoxProfileDir)" || error "Failed to obtain the firefox profile directory."
+
+deps "firefox" "dirname" "readlink" "cp" "mv" "gpg" "which" "sha512sum" "grep" "rm" "ln"
+
+#install firefox update
+echo "Verifying and installing firefox updates..."
+installFirefoxUpdate "$directory" "$mozKey"
+
+#install addon updates
+echo "Installing addons..."
+installAddons "$directory" "$firefoxProfileDir"
+
+#install arkenfox user.js updates, if necessary
+echo "Installing arkenfox user.js updates..."
+installArkenfoxUserJs "$directory" "$firefoxProfileDir"
+
+echo ""
+echo "Update done."

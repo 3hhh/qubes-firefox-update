@@ -1,0 +1,242 @@
+#!/bin/bash
+#
+# See usage().
+#
+# Copyright (C) 2025  David Hobach  GPLv3
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+# 
+
+source blib
+b_checkVersion 1 6 || { >&2 echo "This script depends on blib (https://github.com/3hhh/blib) version 1.6 or higher. Please install a supported version." ; exit 1 ; }
+eval "$B_SCRIPT"
+
+#global vars
+UTIL_DIR="$B_SCRIPT_DIR/util"
+VM_WORK_DIR_DEFAULT="/tmp/$B_SCRIPT_NAME"
+
+b_import "args"
+b_import "types"
+b_import "traps"
+b_import "os/qubes4/dom0"
+
+B_TYPES_ENCODING="utf-8"
+B_DOM0_QVM_RUN_PARAMS=("--no-gui")
+
+function usage {
+echo "$B_SCRIPT_NAME [options] [vm] [addon 1] ... [addon n]
+
+Update firefox to the latest version (if necessary) and update whatever plugins are passed to this script.
+
+IMPORTANT:
+This update tool is only intended for manually managed firefox installations, e.g. if you installed firefox
+from a tarball.
+If you installed firefox from the repositories of your operating system, do not use this tool!
+Also see the README.md for further notes.
+
+[vm]:
+Name of the VM/Qube to which to apply the firefox update.
+The update will be downloaded inside a disposable VM created from that VM unless --downloadvm is specified.
+Afterwards the update is copied to the given VM and installed there.
+
+[addon]:
+Arbitrary number of names to addon description pages whose xpi files are meant to be downloaded
+(e.g. ublock-origin --> https://addons.mozilla.org/en-US/firefox/addon/ublock-origin/).
+If none (--) are passed, only firefox is updated.
+
+[options]:
+  --downloadvm [vm]
+    Use the given VM to download updates instead of creating a disposable VM from
+    the VM to which to apply the firefox update.
+    The given VM currently must hold a copy of the firefox installation found inside [vm],
+    if the local firefox installation is used to identify what needs to be updated.
+
+  --wd [directory]
+    Working directory inside the download VM. Default: $VM_WORK_DIR_DEFAULT
+
+  --lversion [version]
+    Installed local firefox version. If it's not passed, the output of firefox -v is used instead.
+
+  --rversion [version]
+    Remote firefox version to download. If it's not passed, the most recent one is used instead.
+
+  --arch [architecture]
+    The processor architecture. If it's not passed, the output of uname -m is used instead.
+
+  --lang [language]
+    The firefox language. If it's not passed, the local language is used instead.
+
+  -u
+    Also generate an updated user.js and prefs.js from the arkenfox repository.
+    Updates are applied to the locally installed files.
+
+  --user-override [file]
+    Use the given file to override user.js settings with arkenfox. Only makes sense with -u.
+
+  -s
+    Skip the firefox update download and only download addons.
+
+  -h --help
+    Show this help."
+exit 1
+}
+
+function execFuncIn {
+local vm="$1"
+shift
+local vmUser=
+vmUser="$(qvm-prefs "$vm" "default_user")" || { B_ERR="Failed to identify the default user for the VM $vm." ; B_E ; }
+b_info "----- BEGIN $vm VM OUTPUT -----"
+b_types_str b_dom0_execFuncIn "$vm" "$vmUser" "$@" || { B_ERR="Failed to execute the last command inside the VM $vm." ; B_E ; }
+b_info "----- END $vm VM OUTPUT -----"
+}
+
+function generateDownloadArgs {
+local workDir="$1"
+
+#options
+local lversion="$(b_args_getOption "--lversion")"
+[ -n "$lversion" ] && printf -- '--lversion %q ' "$lversion"
+
+local rversion="$(b_args_getOption "--rversion")"
+[ -n "$rversion" ] && printf -- '--rversion %q ' "$rversion"
+
+local arch="$(b_args_getOption "--arch")"
+[ -n "$arch" ] && printf -- '--arch %q ' "$arch"
+
+local lang="$(b_args_getOption "--lang")"
+[ -n "$lang" ] && printf -- '--lang %q ' "$lang"
+
+if b_args_getOption "-u" ; then
+  printf -- '-u '
+
+  local userOverride="$(b_args_getOption "--user-override")"
+  [ -n "$userOverride" ] && printf -- '--user-override %q ' "$workDir/util/user-override.js"
+fi
+
+b_args_getOption "-s" && printf -- '-s '
+
+printf -- '-- '
+
+#args
+local arg_cnt="$(b_args_getCount)"
+local i=
+for ((i=1; i < $arg_cnt ; i++)) ; do
+  printf -- '%q ' "$(b_args_get "$i")"
+done
+printf -- '\n'
+}
+
+#download function run inside the VM where to download firefox
+function vm_download {
+local workDir="$1"
+shift
+
+#redirect stderr to stdout as only stdout is passed to dom0
+exec 2>&1
+
+"$workDir/util/download" "$@" || { B_ERR="Failed to download. Please check the previous output." ; B_E ; }
+}
+
+#update function run inside the VM where to update firefox
+function vm_update {
+local workDir="$1"
+local downloadDir="$2"
+
+#redirect stderr to stdout as only stdout is passed to dom0
+exec 2>&1
+
+#IMPORTANT: We must not use the update script or keys from the download VM, which _may_ have been compromised!
+#remove all scripts, keys etc. (results should be in subfolders only)
+rm -f "$downloadDir"/* &> /dev/null
+
+"$workDir/util/update" "$downloadDir" || { B_ERR="Failed to update. Please check the previous output." ; B_E ; }
+
+#cleanup (may fail)
+rm -rf "$downloadDir" &> /dev/null
+rm -rf "$workDir" &> /dev/null
+exit 0
+}
+
+function main {
+b_args_init 1 "--downloadvm" 1 "--lversion" 1 "--rversion" 1 "--arch" 1 "--lang" 1 "-u" 0 "--user-override" 1 "-s" 0 "-h" 0 "--help" 0
+b_args_parse "$@"
+[ "$(b_args_getCount)" -lt 1 ] && usage
+b_args_getOption "-h" > /dev/null && usage
+b_args_getOption "--help" > /dev/null && usage
+
+b_deps "mktemp" "cp" "rm"
+
+#parse args
+local vm="$(b_args_get 0)"
+
+local downloadvm="$(b_args_getOption "--downloadvm")"
+local userOverride="$(b_args_getOption "--user-override")"
+b_args_getOption "-u" || userOverride=""
+local vmWorkDir="$(b_args_getOption "--wd" "$VM_WORK_DIR_DEFAULT")"
+
+#start the download VM
+if [ -z "$downloadvm" ] ; then
+  b_info "Starting a disposable VM from the template $vm... " 0 1
+  downloadvm="$(b_dom0_startDispVM "$vm")" || { B_ERR="Failed to create a disposable VM from the template VM $vm." ; B_E ; }
+  b_info "$downloadvm started." 1 0
+else
+  b_info "Starting the VM $downloadvm, if necessary... " 0 1
+  b_dom0_ensureRunning "$downloadvm"
+  b_info "$downloadvm started." 1 0
+fi
+
+#copy download scripts
+b_info "Copying the download scripts to the $downloadvm VM ($vmWorkDir)..."
+local dom0WorkDir vmWorkDir cmd
+dom0WorkDir="$(mktemp -d)" || { B_ERR="Failed to create a temporary directory." ; B_E ; }
+printf -v cmd 'rm -rf %q' "$dom0WorkDir"
+b_traps_add "$cmd" EXIT
+cp -rf "$UTIL_DIR" "$dom0WorkDir" || { B_ERR="Failed to copy files to the dom0 working directory." ; B_E ; }
+if [ -n "$userOverride" ] ; then
+  cp -f "$userOverride" "$dom0WorkDir/util/user-override.js" || { B_ERR="Failed to copy the $userOverride file. Incorrect path?!" ; B_E ; }
+fi
+b_dom0_copy "$dom0WorkDir/util" "$downloadvm" "$vmWorkDir"
+
+#download
+b_info "Downloading inside the $downloadvm VM..."
+b_info "SECURITY NOTE: You should see the BEGIN [vm] VM OUTPUT markers only twice. If you see more than that, it may indicate an attack."
+local downArgs=
+downArgs="$(generateDownloadArgs "$vmWorkDir")" || { B_ERR="Failed to generate the download script arguments. A programming error?!" ; B_E ; }
+execFuncIn "$downloadvm" "vm_download" - - "$vmWorkDir" $downArgs
+
+#copy update scripts
+b_info "Copying the update scripts to the $vm VM ($vmWorkDir)..."
+b_dom0_ensureRunning "$vm"
+b_dom0_copy "$UTIL_DIR" "$vm" "$vmWorkDir"
+
+#copy download results
+b_info "Copying the download results from the $downloadvm VM to the $vm VM..."
+local vmUtilDir="$vmWorkDir/util"
+local vmResultDir="$vmUtilDir/tmp-down"
+b_dom0_crossCopy "$downloadvm" "$vmResultDir" "$vm" "$vmUtilDir"
+
+#update
+b_info "Updating inside the $vm VM..."
+execFuncIn "$vm" "vm_update" - - "$vmWorkDir" "$vmResultDir"
+
+#cleanup
+b_info "Cleaning up..."
+b_dom0_ensureHalted "$downloadvm"
+b_dom0_ensureHalted "$vm"
+
+b_info "All done."
+}
+
+main "$@"
