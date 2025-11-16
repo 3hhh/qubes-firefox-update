@@ -106,13 +106,14 @@ local lang="$2"
 local archUri="linux64"
 [ "$arch" != "x86_64" ] && archUri="linux"
 
-local url="https://download.mozilla.org/?product=firefox-latest&os=${archUri}&lang=$lang"
+local url="https://download.mozilla.org/?product=firefox-latest-ssl&os=${archUri}&lang=$lang"
 
 local ret=""
 ret="$(curl -f -L --head "$url" 2> /dev/null)" || error "Failed to retrieve the remote firefox version."
 
-echo "$ret" | sed -r -n 's/^Location:.*\/releases\/([0-9\.]+)\/.*/\1/p'
-return 0
+ret="$(sed -r -n 's/^location:.*\/releases\/([0-9\.]+)\/.*/\1/p' <<< "$ret")" || error "sed failed unexpectedly on the curl output."
+[ -n "$ret" ] || error "Failed to find the remote firefox version in the curl output."
+echo "$ret"
 }
 
 #getRunningArch []
