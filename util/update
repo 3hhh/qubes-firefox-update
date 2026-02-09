@@ -69,8 +69,10 @@ local updater="$firefoxPath/updater"
 #verify
 local hashFile="$srcFirefox/SHA512SUMS"
 local hashSigFile="$hashFile.asc"
-gpg --import "$mozKey" || error "Failed to import the mozilla key from $mozKey."
-gpg --verify "$hashSigFile" "$hashFile" || error "GPG signature verification of the firefox update failed! Please investigate!"
+local out fingerprint
+out="$(gpg -q --with-colons --import --import-options "import-show" "$mozKey")" || error "Failed to import the mozilla key from $mozKey."
+fingerprint="$(sed -rn 's/^fpr:::::::::(.*):$/\1/p' <<< "$out" | head -n1)" || error "Failed to extract the fingerprint from the mozilla key $mozKey. Output: $out"
+gpg --assert-signer "$fingerprint" --verify "$hashSigFile" "$hashFile" || error "GPG signature verification of the firefox update failed! Please investigate!"
 hash="$(sha512sum "$updateFile")" || error "Failed to compute the hash of $updateFile."
 hash="${hash%% *}"
 [ -z "$hash" ] && error "Hash computation failed. Programming error?!"
@@ -155,7 +157,7 @@ fi
 mozKey="$SCRIPT_DIR/mozkey.asc"
 firefoxProfileDir="$(getFirefoxProfileDir)" || error "Failed to obtain the firefox profile directory."
 
-deps "firefox" "dirname" "readlink" "cp" "mv" "gpg" "which" "sha512sum" "grep" "rm" "ln"
+deps "firefox" "dirname" "readlink" "cp" "mv" "gpg" "which" "sha512sum" "grep" "rm" "ln" "sed" "head"
 
 #install firefox update
 echo "Verifying and installing firefox updates..."
