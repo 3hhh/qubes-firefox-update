@@ -25,6 +25,10 @@ SCRIPT_DIR="$(dirname "$SCRIPT_DIR")" || exit 6
 SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
 DIRECTORY_DEFAULT="$SCRIPT_DIR/tmp-down"
 
+#the fingerprint of the key used to sign firefox updates
+#must be updated on mozkey.asc updates
+FIREFOX_KEY_FINGERPRINT="827E658608679618CD349F93678E455D76767AA3"
+
 #import common code
 source "$SCRIPT_DIR/common" || exit 7
 
@@ -69,10 +73,11 @@ local updater="$firefoxPath/updater"
 #verify
 local hashFile="$srcFirefox/SHA512SUMS"
 local hashSigFile="$hashFile.asc"
-local out fingerprint
+local out
 out="$(gpg -q --with-colons --import --import-options "import-show" "$mozKey")" || error "Failed to import the mozilla key from $mozKey."
-fingerprint="$(sed -rn 's/^fpr:::::::::(.*):$/\1/p' <<< "$out" | head -n1)" || error "Failed to extract the fingerprint from the mozilla key $mozKey. Output: $out"
-gpg --assert-signer "$fingerprint" --verify "$hashSigFile" "$hashFile" || error "GPG signature verification of the firefox update failed! Please investigate!"
+#local fingerprint
+#fingerprint="$(sed -rn 's/^fpr:::::::::(.*):$/\1/p' <<< "$out" | head -n1)" || error "Failed to extract the fingerprint from the mozilla key $mozKey. Output: $out"
+gpg --assert-signer "$FIREFOX_KEY_FINGERPRINT" --verify "$hashSigFile" "$hashFile" || error "GPG signature verification of the firefox update failed! Please investigate!"
 hash="$(sha512sum "$updateFile")" || error "Failed to compute the hash of $updateFile."
 hash="${hash%% *}"
 [ -z "$hash" ] && error "Hash computation failed. Programming error?!"
