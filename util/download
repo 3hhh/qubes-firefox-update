@@ -2,7 +2,7 @@
 #
 # See usage().
 #
-# Copyright (C) 2025  David Hobach  GPLv3
+# Copyright (C) 2026  David Hobach  GPLv3
 # 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -38,6 +38,13 @@ DOWNLOAD_DIR_ARKENFOX="$DOWNLOAD_DIR/arkenfox"
 
 #where to write arkenfox output (user.ks & prefs.js)
 ARKENFOX_OUT="$DOWNLOAD_DIR/arkenfox-out"
+
+#addon name --> download URL for the latest version
+#use https://addons.mozilla.org/en-US/firefox/ to find URLs - make sure to remove the absolute file name from the URL though
+declare -A ADDON_URLS=(
+	["ublock-origin"]="https://addons.mozilla.org/firefox/downloads/file/5034826/"
+	["indicatetls"]="https://addons.mozilla.org/firefox/downloads/file/4756082/"
+)
 
 #static fallback when the addon ID cannot be found inside the manifest.json (which is allowed)
 #addon name (from download URL) --> ID
@@ -155,16 +162,19 @@ fi
 return 0
 }
 
-#downloadFile [URL] [dir]
+#downloadFile [URL] [dir] [file name (optional)]
 #download the given file to the given dir
 #returns: sets a non-zero exit code on errors
 function downloadFile {
 local url="$1"
 local dir="$2"
+local file="$3"
 local ret=
 echo "Downloading ${url}..."
-local file="${url##*/}"
-[ -z "$file" ] && return 1
+if [ -z "$file" ] ; then
+	file="${url##*/}"
+	[ -z "$file" ] && return 1
+fi
 file="$dir/$file"
 mkdir -p "$dir" || return 1
 
@@ -205,31 +215,19 @@ fi
 return 0
 }
 
-#getAddonDownloadUrl [overview URL]
-function getAddonDownloadUrl {
-local oUrl="$1"
-local ret=""
-ret="$(curl -f "$oUrl")" || error "Failed to run curl on ${oUrl}."
-echo "$ret" | sed -r 's/\\u002F/\//g' | grep -E -o 'https://addons.mozilla.org/firefox/downloads/file/[^"?]+' | head -n1
-}
-
 #downloadAddons [lang] [addon name] ... [addon name n]
 function downloadAddons {
 local lang="$1"
 shift
-local addonOverviewUrl=""
-local addonUrl=""
 local addon=""
 while [ $# -gt 0 ] ; do
 	addon="$1"
 	shift
 	[ -z "$addon" ] && continue
 
-	addonOverviewUrl="https://addons.mozilla.org/${lang}/firefox/addon/${addon}/"
+	[ -z "${ADDON_URLS["$addon"]}" ] && error "No URL to download the addon $addon found. Please add the URL to the ADDON_URLS array and retry."
 
-	#get the download URL && download
-	addonUrl="$(getAddonDownloadUrl "$addonOverviewUrl")" || error "Failed to retrieve the addon download URL from the overview URL $addonOverviewUrl."
-	downloadFile "$addonUrl" "$DOWNLOAD_DIR_ADDONS" || error "Failed to download $addonUrl."
+	downloadFile "${ADDON_URLS["$addon"]}" "$DOWNLOAD_DIR_ADDONS" "${addon}.xpi" || error "Failed to download ${ADDON_URLS["$addon"]}."
 done
 }
 
